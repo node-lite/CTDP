@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nodelite-deps"
+version = "0.1.0"
+description = "Cross-package-manager dependency preparation for SWE-smith"
+requires-python = ">=3.11"
+dependencies = [
+  "PyYAML>=6.0",
+  "json5>=0.9",
+  "requests>=2.31",
+]
+
+[project.scripts]
+nodelite-deps = "nodelite_deps.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

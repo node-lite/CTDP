@@ -1,0 +1,65 @@
+# Generated acceptance runs (CAS, native PM caches, logs, reports, snapshots)
+acceptance-out/
+out/
+
+# Python bytecode, test, type-check, and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+build/
+dist/
+*.egg-info/
+
+# Local Python environments
+.venv/
+venv/
+env/
+
+# Package-manager working directories and caches
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+.bun/
+
+# Logs, temporary files, and local caches
+*.log
+logs/
+.cache/
+tmp/
+temp/
+*.tmp
+*.swp
+*~
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+.npmrc
+.npmrc.local
+.yarnrc.local.yml
+.secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# IDE and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
