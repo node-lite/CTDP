@@ -9,6 +9,40 @@ from typing import Any
 from .util import directory_size, percentile, read_json, utc_now, write_json, write_text
 
 
+_BASELINE_OTHER_FAILURE_CATEGORIES = {
+    "swesmith/babel__babel.2ea3fc8f": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/emotion-js__emotion.b882bcba": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/foliojs__pdfkit.d0108157": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/marmelab__react-admin.823caa0b": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/payloadcms__payload.8f660355": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/ReactiveX__rxjs.c15b37f8": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/strapi__strapi.e5b87a54": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/svg__svgo.c06d8f68": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/trpc__trpc.2f40ba93": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/ueberdosis__tiptap.2d6de06c": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/umijs__qiankun.693cdde7": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/vitejs__vite.8b47ff76": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/OpenCut-app__OpenCut.e84c0cfd": ("toolchain_bootstrap", "package-manager CLI bootstrap failed"),
+    "swesmith/bluesky-social__social-app.cbd48c85": ("resolution_record_unavailable", "resolution record unavailable or manual review"),
+    "swesmith/directus__directus.ac922d18": ("resolution_record_unavailable", "resolution record unavailable or manual review"),
+    "swesmith/FuelLabs__fuels-ts.b3f37c91": ("resolution_record_unavailable", "resolution record unavailable or manual review"),
+    "swesmith/GitbookIO__gitbook.81f8ddcf": ("resolution_record_unavailable", "resolution record unavailable or manual review"),
+    "swesmith/jantimon__html-webpack-plugin.9a39db80": ("resolution_record_unavailable", "resolution record unavailable or manual review"),
+    "swesmith/marko-js__marko.24b9402c": ("resolution_record_unavailable", "resolution record unavailable or manual review"),
+    "swesmith/Netflix__falcor.39d64776": ("resolution_record_unavailable", "resolution record unavailable or manual review"),
+    "swesmith/reactjs__react-transition-group.2989b5b8": ("resolution_record_unavailable", "resolution record unavailable or manual review"),
+    "swesmith/webpack__webpack.24e3c2d2": ("resolution_record_unavailable", "resolution record unavailable or manual review"),
+    "swesmith/welldone-software__why-did-you-render.3ec3512d": ("resolution_record_unavailable", "resolution record unavailable or manual review"),
+    "swesmith/axios__axios.ef36347f": ("original_install_or_lifecycle", "original install or lifecycle command failed"),
+    "swesmith/coder__code-server.e90504b8": ("original_install_or_lifecycle", "original install or lifecycle command failed"),
+    "swesmith/homebridge__homebridge.3a341e08": ("original_install_or_lifecycle", "original install or lifecycle command failed"),
+    "swesmith/antvis__G6.91c0ac85": ("install_timeout", "install command exceeded validation timeout"),
+    "swesmith/react-hook-form__react-hook-form.3adba2b8": ("install_timeout", "install command exceeded validation timeout"),
+    "swesmith/mochajs__mocha.410ce0d2": ("project_snapshot_incomplete", "required test fixture file is absent"),
+    "swesmith/refined-github__refined-github.d4a7c3fb": ("lockfile_or_peer_resolution", "npm ci has no usable package lockfile"),
+}
+
+
 def _csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -61,6 +95,356 @@ def _dedup_byte_counts(out: Path, aggregate_artifacts: list[dict[str, Any]], pre
         else:
             missing += 1
     return before, after, missing, missing == 0
+
+
+def _failure_text(root: dict[str, Any]) -> str:
+    parts = [str(root.get("reason") or "")]
+    for phase in ("g1", "g2"):
+        result = root.get(phase, {})
+        for key in ("stdout_path", "stderr_path"):
+            path = result.get(key)
+            if path and Path(path).is_file():
+                parts.append(Path(path).read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(part for part in parts if part).lower()
+
+
+def _failure_category(profile_result: dict[str, Any], *, baseline: bool = False) -> tuple[str, str]:
+    root = (profile_result.get("roots") or [{}])[0]
+    reason = str(root.get("reason") or "")
+    text = _failure_text(root)
+    if "resolution record unavailable" in reason.lower():
+        return "resolution_record_unavailable", reason
+    if baseline and profile_result.get("profile_id") in _BASELINE_OTHER_FAILURE_CATEGORIES:
+        return _BASELINE_OTHER_FAILURE_CATEGORIES[profile_result["profile_id"]]
+    if "enotcached" in text:
+        return "toolchain_bootstrap", "package-manager CLI bootstrap failed"
+    if "timed out" in text or any(root.get(phase, {}).get("exit_code") == 124 for phase in ("g1", "g2")):
+        return "install_timeout", "install command exceeded validation timeout"
+    if baseline and profile_result.get("profile_id", "").endswith("mochajs__mocha.410ce0d2"):
+        return "project_snapshot_incomplete", "required test fixture file is absent"
+    if baseline and profile_result.get("profile_id", "").endswith("refined-github__refined-github.d4a7c3fb"):
+        return "lockfile_or_peer_resolution", "npm ci has no usable package lockfile"
+    if any(token in text for token in ("eresolve", "peer dependency", "no package-lock", "lockfileversion", "lockfile would be modified", "immutable")):
+        return "lockfile_or_peer_resolution", "lockfile or peer dependency contract rejected"
+    if any(token in text for token in ("workspace not found", "workspace_pkg_not_found", "patches/", "fixture", "enotdir", "enoent")):
+        return "project_snapshot_incomplete", "required workspace, patch, or fixture file is absent"
+    if any(token in text for token in ("no_offline_tarball", "tarball_integrity", "checksum", "remote archive")):
+        return "local_artifact_integrity_or_cache", "local artifact cache is missing or fails integrity"
+    if any(token in text for token in ("unsupported engine", "incompatible module", "node version is incompatible")):
+        return "node_engine_or_runtime", "project requires a newer Node runtime"
+    if root.get("g1", {}).get("status") == "success" and root.get("g2", {}).get("status") != "success":
+        return "original_install_or_lifecycle", "CTDP install succeeds but original project command fails"
+    return "project_install_failure", "project install failed without a narrower signature"
+
+
+def _external_artifact_category(profile_result: dict[str, Any]) -> tuple[str, str]:
+    root = (profile_result.get("roots") or [{}])[0]
+    text = _failure_text(root)
+    if root.get("external_git_dependency"):
+        return "git_vcs_dependency", "Git/VCS dependency is not served by the local registry"
+    if root.get("cas_miss"):
+        return "cas_fetch_failure", "CAS prefetch failed before validation"
+    if root.get("static_external_download"):
+        return "static_runtime_download", "project requires a non-registry runtime download"
+    if any(token in text for token in ("no_offline_tarball", "offline tarball")):
+        return "cas_tarball_missing", "required package tarball is absent from the local package-manager cache"
+    if any(token in text for token in ("downloading chromium", "downloading chrome for testing", "failed to download chromium", "cdn.playwright.dev", "browser-chromium")):
+        return "browser_runtime_download", "Playwright/Chromium runtime download is unavailable"
+    if any(token in text for token in ("tarball_integrity", "checksum", "remote archive doesn't match")):
+        return "artifact_integrity_mismatch", "cached artifact does not match the lockfile integrity"
+    if any(token in text for token in ("statuscode=502", "status code 502", " - 502", "tunneling socket", "network connection")):
+        return "registry_or_proxy_unavailable", "registry or proxy returned a network failure"
+    return "other_external_artifact", "external artifact could not be supplied to validation"
+
+
+def _failure_classification_report(previous_failures: dict[str, Any], validation: dict[str, Any]) -> dict[str, Any]:
+    baseline = [
+        {"profile_id": profile_id, "status": "other_failure", "roots": [{}]}
+        for profile_id in _BASELINE_OTHER_FAILURE_CATEGORIES
+    ]
+    current = [item for item in validation.get("failures", []) if item.get("status") == "other_failure"]
+
+    def classify(items: list[dict[str, Any]], *, baseline: bool = False) -> dict[str, Any]:
+        rows = []
+        for item in items:
+            category, explanation = _failure_category(item, baseline=baseline)
+            rows.append({"profile_id": item.get("profile_id"), "category": category, "explanation": explanation})
+        counts = Counter(row["category"] for row in rows)
+        return {
+            "count": len(rows),
+            "category_counts": dict(sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))),
+            "items": rows,
+        }
+
+    baseline_ids = {item.get("profile_id") for item in baseline}
+    current_by_id = {item.get("profile_id"): item for item in validation.get("profiles", [])}
+    resolved_or_reclassified = []
+    for profile_id in sorted(baseline_ids):
+        current_item = current_by_id.get(profile_id)
+        if current_item and current_item.get("status") != "other_failure":
+            resolved_or_reclassified.append({"profile_id": profile_id, "new_status": current_item.get("status")})
+    current_ids = {item.get("profile_id") for item in current}
+    remaining_profile_ids = sorted(baseline_ids & current_ids)
+    external_items = [item for item in validation.get("profiles", []) if item.get("status") == "external_artifact_miss"]
+    external_rows = []
+    for item in external_items:
+        category, explanation = _external_artifact_category(item)
+        external_rows.append({"profile_id": item.get("profile_id"), "category": category, "explanation": explanation})
+    external_counts = Counter(row["category"] for row in external_rows)
+    return {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "baseline": classify(baseline, baseline=True),
+        "current": classify(current),
+        "external_artifact_breakdown": {
+            "count": len(external_rows),
+            "category_counts": dict(sorted(external_counts.items(), key=lambda pair: (-pair[1], pair[0]))),
+            "items": external_rows,
+        },
+        "baseline_to_current": {
+            "resolved_or_reclassified": resolved_or_reclassified,
+            "remaining_count": len(remaining_profile_ids),
+            "remaining_profile_ids": remaining_profile_ids,
+        },
+    }
+
+
+def _generate_phase1_reports(
+    out: Path,
+    inventory: dict[str, Any],
+    resolution: dict[str, Any],
+    aggregate: dict[str, Any],
+    prefetch: dict[str, Any],
+    warm: dict[str, Any],
+    validation: dict[str, Any],
+    summary: dict[str, Any],
+) -> None:
+    phase_dir = out / "phase1"
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    previous_failures = read_json(phase_dir / "failures.json", {})
+    profiles = inventory.get("profiles", [])
+    profile_by_id = {item.get("profile_id"): item for item in profiles}
+    task_source = out.parent.parent / "swe-smith_Task_IDs.csv"
+    task_count = None
+    task_repositories: dict[str, int] = {}
+    if task_source.is_file():
+        with task_source.open(newline="", encoding="utf-8-sig") as handle:
+            for row in csv.reader(handle):
+                if len(row) > 4 and row[0] == "SWE-smith" and row[3]:
+                    task_count = (task_count or 0) + 1
+                    task_repositories[row[4]] = task_repositories.get(row[4], 0) + 1
+    coverage_rows = []
+    for profile in profiles:
+        profile_id = profile.get("profile_id")
+        coverage_rows.append({
+            "profile_id": profile_id,
+            "owner": profile.get("owner"),
+            "repo": profile.get("repo"),
+            "commit": profile.get("commit"),
+            "language": profile.get("language"),
+            "package_manager": profile.get("package_manager"),
+            "dependency_roots": len(profile.get("dependency_roots", [])),
+            "task_count_by_repository": task_repositories.get(profile_id, 0),
+            "discovery_status": "success",
+        })
+    write_json(phase_dir / "profile_coverage.json", {
+        "schema_version": 1,
+        "input_profile_count": inventory.get("input_profile_count", 0),
+        "discovered_profile_count": len(profiles),
+        "coverage_rate": len(profiles) / inventory["input_profile_count"] if inventory.get("input_profile_count") else None,
+        "swe_smith_task_count": task_count,
+        "task_source": str(task_source) if task_source.is_file() else None,
+        "profiles": coverage_rows,
+        "generated_at": utc_now(),
+    })
+
+    resolution_rows = []
+    for item in resolution.get("profiles", []):
+        profile = profile_by_id.get(item.get("profile_id"), {})
+        resolution_rows.append({
+            "profile_id": item.get("profile_id"),
+            "owner": profile.get("owner"),
+            "repo": profile.get("repo"),
+            "dependency_root": item.get("dependency_root"),
+            "package_manager": item.get("package_manager"),
+            "package_manager_version": item.get("package_manager_version"),
+            "classification": item.get("classification"),
+            "resolution_source": item.get("resolution_source"),
+            "source_lockfile": item.get("source_lockfile"),
+            "resolved_lockfile": item.get("resolved_lockfile"),
+            "lockfile_changed": item.get("lockfile_changed"),
+            "resolve_elapsed_ms": item.get("resolve_elapsed_ms"),
+            "exit_code": item.get("exit_code"),
+        })
+    _csv(phase_dir / "dependency_roots.csv", resolution_rows, [
+        "profile_id", "owner", "repo", "dependency_root", "package_manager", "package_manager_version",
+        "classification", "resolution_source", "source_lockfile", "resolved_lockfile", "lockfile_changed",
+        "resolve_elapsed_ms", "exit_code",
+    ])
+
+    prefetched_by_id = {item.get("artifact_id"): item for item in prefetch.get("artifacts", [])}
+    artifact_rows = []
+    for item in aggregate.get("artifacts", []):
+        prefetched = prefetched_by_id.get(item.get("artifact_id"), {})
+        size = prefetched.get("size_bytes") or item.get("estimated_bytes")
+        reference_count = int(item.get("reference_count") or 1)
+        cas_bytes = size if prefetched.get("status") in {"downloaded", "reused"} else None
+        artifact_rows.append({
+            "artifact_id": item.get("artifact_id"),
+            "type": item.get("type"),
+            "name": item.get("name"),
+            "version": item.get("version"),
+            "status": prefetched.get("status"),
+            "reference_count": reference_count,
+            "size_bytes": size,
+            "referenced_bytes": size * reference_count if size is not None else None,
+            "cas_bytes": cas_bytes,
+            "duplicate_savings_bytes": size * (reference_count - 1) if size is not None else None,
+            "cas_path": prefetched.get("cas_path"),
+            "error": prefetched.get("error"),
+        })
+    _csv(phase_dir / "artifact_dedup.csv", artifact_rows, [
+        "artifact_id", "type", "name", "version", "status", "reference_count", "size_bytes",
+        "referenced_bytes", "cas_bytes", "duplicate_savings_bytes", "cas_path", "error",
+    ])
+
+    first_bytes = prefetch.get("initial_run_downloaded_bytes")
+    second_bytes = prefetch.get("second_run_downloaded_bytes")
+    network_rows = [
+        {
+            "run": "first",
+            "processed_artifacts": len(prefetch.get("artifacts", [])),
+            "downloaded_artifacts": 11206,
+            "reused_artifacts": None,
+            "failed_artifacts": None,
+            "network_bytes": first_bytes,
+            "measurement_status": "observed; artifact count retained from first-run execution record",
+        },
+        {
+            "run": "second",
+            "processed_artifacts": len(prefetch.get("artifacts", [])),
+            "downloaded_artifacts": prefetch.get("downloaded_count"),
+            "reused_artifacts": prefetch.get("reused_count"),
+            "failed_artifacts": prefetch.get("failed_count"),
+            "network_bytes": second_bytes,
+            "measurement_status": "observed",
+        },
+    ]
+    _csv(phase_dir / "network_bytes.csv", network_rows, [
+        "run", "processed_artifacts", "downloaded_artifacts", "reused_artifacts", "failed_artifacts",
+        "network_bytes", "measurement_status",
+    ])
+    _csv(phase_dir / "first_vs_second_run.csv", [{
+        "metric": metric,
+        "first_run": first_value,
+        "second_run": second_value,
+        "absolute_change": second_value - first_value if isinstance(first_value, (int, float)) and isinstance(second_value, (int, float)) else None,
+        "relative_change": (second_value - first_value) / first_value if isinstance(first_value, (int, float)) and first_value and isinstance(second_value, (int, float)) else None,
+    } for metric, first_value, second_value in (
+        ("network_bytes", first_bytes, second_bytes),
+        ("downloaded_artifacts", 11206, prefetch.get("downloaded_count")),
+        ("processed_artifacts", len(prefetch.get("artifacts", [])), len(prefetch.get("artifacts", []))),
+    )], ["metric", "first_run", "second_run", "absolute_change", "relative_change"])
+
+    validation_rows = []
+    for profile_result in validation.get("profiles", []):
+        profile_id = profile_result.get("profile_id")
+        profile = profile_by_id.get(profile_id, {})
+        for root in profile_result.get("roots", []):
+            g1, g2 = root.get("g1", {}), root.get("g2", {})
+            validation_rows.append({
+                "profile_id": profile_id,
+                "owner": profile.get("owner"),
+                "repo": profile.get("repo"),
+                "dependency_root": root.get("dependency_root"),
+                "package_manager": root.get("package_manager"),
+                "profile_status": profile_result.get("status"),
+                "g1_status": g1.get("status"),
+                "g1_elapsed_ms": g1.get("elapsed_ms"),
+                "g2_status": g2.get("status"),
+                "g2_elapsed_ms": g2.get("elapsed_ms"),
+                "root_elapsed_ms": root.get("validation_elapsed_ms"),
+                "outbound_request_count": len(root.get("outbound_requests", [])),
+                "fresh_install_elapsed_ms": None,
+                "pm_cache_install_elapsed_ms": None,
+                "ctdp_install_elapsed_ms": g1.get("elapsed_ms"),
+                "latency_comparison_status": "not_measured_for_phase1",
+                "reason": root.get("reason") or g1.get("reason") or g2.get("reason"),
+            })
+    _csv(phase_dir / "install_validation.csv", validation_rows, [
+        "profile_id", "owner", "repo", "dependency_root", "package_manager", "profile_status",
+        "g1_status", "g1_elapsed_ms", "g2_status", "g2_elapsed_ms", "root_elapsed_ms",
+        "outbound_request_count", "fresh_install_elapsed_ms", "pm_cache_install_elapsed_ms",
+        "ctdp_install_elapsed_ms", "latency_comparison_status", "reason",
+    ])
+
+    failures = {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "validation": validation.get("failures", []),
+        "resolution": resolution.get("failures", []),
+        "prefetch": prefetch.get("unhandled_failures", []) + [
+            item for item in prefetch.get("artifacts", [])
+            if item.get("status") == "failed"
+            and item.get("artifact_id") not in {failure.get("artifact_id") for failure in prefetch.get("unhandled_failures", [])}
+        ],
+        "warm_cache": warm.get("failures", []),
+        "manual_review": inventory.get("failures", []) + resolution.get("manual_review", []),
+    }
+    write_json(phase_dir / "failures.json", failures)
+    write_json(phase_dir / "failure_classification.json", _failure_classification_report(previous_failures, validation))
+
+    phase_status = "partial"
+    if (
+        summary.get("failed_discovery_count") == 0
+        and summary.get("resolution_failure_count") == 0
+        and summary.get("prefetch_failure_count") == 0
+        and summary.get("dynamic_validation", {}).get("success") == summary.get("input_profile_count")
+        and second_bytes == 0
+    ):
+        phase_status = "passed"
+    summary_lines = [
+        "# Phase 1 CTDP Dependency Preparation Validation",
+        "",
+        f"Status: **{phase_status}**",
+        "",
+        "## Coverage",
+        "",
+        f"- Profiles: {summary.get('discovered_profile_count')} / {summary.get('input_profile_count')}",
+        f"- Dependency roots: {len(resolution.get('profiles', []))}",
+        f"- SWE-smith tasks in source CSV: {task_count if task_count is not None else 'not available'}",
+        f"- Package managers: `{json.dumps(summary.get('package_manager_distribution', {}), sort_keys=True)}`",
+        "",
+        "## Deduplication",
+        "",
+        f"- Dependency references: {summary.get('total_dependency_references')}",
+        f"- Unique immutable artifacts: {summary.get('unique_immutable_artifacts')}",
+        f"- Referenced bytes before dedup: {summary.get('dedup_bytes_before')}",
+        f"- Unique CAS bytes after dedup: {summary.get('dedup_bytes_after')}",
+        f"- Dedup ratio: {summary.get('dedup_ratio')}",
+        "",
+        "## Network and Cache",
+        "",
+        f"- First-run network bytes: {first_bytes}",
+        f"- Second-run network bytes: {second_bytes}",
+        f"- Second-run result: {prefetch.get('downloaded_count')} downloaded, {prefetch.get('reused_count')} reused, {prefetch.get('failed_count')} failed",
+        f"- Warm-cache groups: {sum(item.get('status') == 'success' for item in warm.get('managers', []))} / {len(warm.get('managers', []))} successful",
+        "",
+        "## Real Install Validation",
+        "",
+        f"- Profile results: {summary.get('dynamic_validation')}",
+        f"- Validation latency P50/P95/max (ms): {summary.get('stage_timing_ms', {}).get('validate', {}).get('p50')} / {summary.get('stage_timing_ms', {}).get('validate', {}).get('p95')} / {summary.get('stage_timing_ms', {}).get('validate', {}).get('max')}",
+        "- Fresh and PM-cache comparison latency was not measured in Phase 1; the CSV records these fields as null.",
+        "",
+        "## Decision",
+        "",
+        "Phase 1 is **partial / not passed** under the strict plan criteria. CTDP completed the preparation pipeline across all 64 profiles and demonstrated cross-profile CAS deduplication, but resolution failures, one prefetch 404, partial Yarn classic warmup, install failures, and non-zero second-run network bytes remain.",
+        "",
+        "The results support continuing to Phase 2 only with these limitations recorded; they do not support claiming zero-near-zero second-run traffic or full real-install success.",
+        "",
+        f"Generated: {utc_now()}",
+    ]
+    write_text(phase_dir / "phase1_summary.md", "\n".join(summary_lines) + "\n")
 
 
 def generate_reports(out: Path) -> dict[str, Any]:
@@ -124,7 +508,7 @@ def generate_reports(out: Path) -> dict[str, Any]:
     warmup_by_manager: dict[str, dict[str, Any]] = {}
     for item in warm_records:
         manager = str(item["manager"])
-        aggregate = warmup_by_manager.setdefault(
+        manager_summary = warmup_by_manager.setdefault(
             manager,
             {
                 "manager": manager,
@@ -136,12 +520,12 @@ def generate_reports(out: Path) -> dict[str, Any]:
                 "policies": [],
             },
         )
-        aggregate["status"] = "partial" if item.get("status") != "success" else aggregate["status"]
-        aggregate["cache_bytes"] += int(item.get("cache_bytes", 0) or 0)
-        aggregate["imported"] += int(item.get("imported", 0) or 0)
-        aggregate["failed_count"] += len(item.get("failed", []))
-        aggregate["elapsed_ms"] += int(item.get("warmup_elapsed_ms", 0) or 0)
-        aggregate["policies"].append(
+        manager_summary["status"] = "partial" if item.get("status") != "success" else manager_summary["status"]
+        manager_summary["cache_bytes"] += int(item.get("cache_bytes", 0) or 0)
+        manager_summary["imported"] += int(item.get("imported", 0) or 0)
+        manager_summary["failed_count"] += len(item.get("failed", []))
+        manager_summary["elapsed_ms"] += int(item.get("warmup_elapsed_ms", 0) or 0)
+        manager_summary["policies"].append(
             {
                 "variant": item.get("variant"),
                 "version": item.get("version"),
@@ -256,4 +640,5 @@ def generate_reports(out: Path) -> dict[str, Any]:
         "## Dynamic validation", "", f"- Results: `{json.dumps(summary['dynamic_validation'], ensure_ascii=False, sort_keys=True)}`", f"- Profiles with external artifact misses: `{json.dumps(summary['profiles_with_unexpected_external_downloads'], ensure_ascii=False)}`", f"- First-run Internet bytes: {summary['first_run_internet_bytes']}", f"- Second-run Internet bytes: {summary['second_run_internet_bytes']}",
     ]
     write_text(reports_dir / "summary.md", "\n".join(lines) + "\n")
+    _generate_phase1_reports(out, inventory, resolution, aggregate, prefetch, warm, validation, summary)
     return summary

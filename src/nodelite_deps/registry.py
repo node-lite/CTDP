@@ -30,7 +30,9 @@ class LocalArtifactRegistry:
                 continue
             key = _package_key(item.get("name"), item.get("version"))
             if key and item.get("status") in {"downloaded", "reused"} and item.get("cas_path"):
-                self._by_package.setdefault(key, item)
+                current = self._by_package.get(key)
+                if current is None or self._prefer_package_artifact(item, current):
+                    self._by_package[key] = item
         registry = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -77,6 +79,15 @@ class LocalArtifactRegistry:
                 package_path = unquote(path.lstrip("/"))
                 if package_path.startswith("registry/"):
                     package_path = package_path.removeprefix("registry/")
+                if "/-/" in package_path:
+                    package, filename = package_path.split("/-/", 1)
+                    for (name, version), item in registry._by_package.items():
+                        expected = f"{name.rsplit('/', 1)[-1]}-{version}.tgz"
+                        if name == package and filename == expected:
+                            self._serve_blob(item)
+                            return
+                    self._send(404, b"tarball unavailable\n", "text/plain")
+                    return
                 if package_path.startswith("@") and "/-" in package_path:
                     package_path = package_path.split("/-", 1)[0]
                 if "/-" in package_path:
@@ -139,6 +150,30 @@ class LocalArtifactRegistry:
     def base_url(self) -> str:
         host, port = self._server.server_address
         return f"http://{host}:{port}"
+
+    @staticmethod
+    def _prefer_package_artifact(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
+        def source_consistent(item: dict[str, Any]) -> bool:
+            source = item.get("source_url") or item.get("source")
+            name, version = item.get("name"), item.get("version")
+            if not isinstance(source, str) or "/-/" not in source:
+                return True
+            filename = source.split("#", 1)[0].rsplit("/", 1)[-1]
+            return filename == f"{str(name).rsplit('/', 1)[-1]}-{version}.tgz"
+
+        candidate_score = (
+            source_consistent(candidate),
+            bool(candidate.get("integrity")),
+            bool(candidate.get("content_sha256")),
+            candidate.get("status") == "downloaded",
+        )
+        current_score = (
+            source_consistent(current),
+            bool(current.get("integrity")),
+            bool(current.get("content_sha256")),
+            current.get("status") == "downloaded",
+        )
+        return candidate_score > current_score
 
     def tarball_url(self, artifact: dict[str, Any]) -> str:
         return f"{self.base_url}/tarballs/{quote(str(artifact['artifact_id']), safe='')}.tgz"

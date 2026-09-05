@@ -41,6 +41,7 @@
 - `out/reports/dedup.json`：全局去重统计。
 - `out/reports/failures.json`：解析、预取、缓存和验证失败。
 - `out/reports/manual_review.json`：需要人工检查的协议或项目。
+- `out/phase1/`：实验计划要求的 coverage、root、artifact、网络、安装验证和 Phase 1 总结文件。
 
 ## 处理流程
 

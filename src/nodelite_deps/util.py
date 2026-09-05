@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import time
@@ -121,23 +122,26 @@ def run_command(
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=merged_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
     try:
-        result = subprocess.run(
-            command,
-            cwd=cwd,
-            env=merged_env,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-        exit_code = result.returncode
-        stdout = result.stdout
-        stderr = result.stderr
+        stdout, stderr = process.communicate(timeout=timeout)
+        exit_code = process.returncode
         timed_out = False
-    except subprocess.TimeoutExpired as error:
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate()
         exit_code = 124
-        stdout = error.stdout or b""
-        stderr = (error.stderr or b"") + f"\nTimed out after {timeout}s\n".encode()
+        stderr = (stderr or b"") + f"\nTimed out after {timeout}s\n".encode()
         timed_out = True
     if stdout_path:
         atomic_write(stdout_path, stdout)

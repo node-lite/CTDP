@@ -18,10 +18,23 @@ from nodelite_deps.logging import EventLogger
 from nodelite_deps.registry import LocalArtifactRegistry
 from nodelite_deps.toolchain import version_matches
 from nodelite_deps.util import verify_sri
-from nodelite_deps.validation import _rewrite_json_lock
+from nodelite_deps.validation import _artifact_for_url, _artifact_maps, _failure_status, _rewrite_json_lock
 
 
 class AdapterTests(unittest.TestCase):
+    def test_failure_status_reads_logs_and_prioritizes_snapshot_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "install.log"
+            log.write_text(
+                "Unsupported engine\nENOENT: no such file or directory, open /tmp/nodelite-deps-validate-x/patches/fix.patch\n"
+            )
+            result = {"exit_code": 1, "stdout_path": str(log)}
+            self.assertEqual(_failure_status(result, []), "other_failure")
+
+    def test_failure_status_avoids_keyword_false_positives(self) -> None:
+        self.assertEqual(_failure_status({"exit_code": 1, "stdout": "es2015.proxy p404d5"}, []), "other_failure")
+        self.assertEqual(_failure_status({"exit_code": 1, "stdout": "node-gyp configure error"}, [{"url": "https://registry.test"}]), "native_or_system_dependency_failure")
+
     def test_npm_package_lock_v2(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "package-lock.json"
@@ -146,6 +159,17 @@ class CasTests(unittest.TestCase):
 
 
 class RegistryTests(unittest.TestCase):
+    def test_git_source_alias_resolves_to_local_artifact(self) -> None:
+        artifact = {
+            "artifact_id": "git-fixture",
+            "type": "git",
+            "source_url": "git+ssh://git@gist.github.com/fixture.git#deadbeef",
+            "status": "reused",
+            "cas_path": "cas/blobs/sha256/fixture",
+        }
+        by_source, by_package = _artifact_maps([artifact])
+        self.assertIs(_artifact_for_url("gist:fixture", by_source, by_package), artifact)
+
     def test_scoped_packument_tarball_and_lock_rewrite(self) -> None:
         payload = b"registry fixture"
         with tempfile.TemporaryDirectory() as temp:

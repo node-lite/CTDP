@@ -11,6 +11,21 @@ from .util import run_command
 _VERSION_CACHE: dict[tuple[str, ...], str | None] = {}
 
 
+def _npx_prefix(package: str, executable: str) -> list[str]:
+    npm_cache = Path.home() / ".npm"
+    return [
+        "env",
+        "npm_config_registry=https://registry.npmjs.org",
+        f"npm_config_cache={npm_cache}",
+        "npx",
+        "--offline",
+        "--yes",
+        "--package",
+        package,
+        executable,
+    ]
+
+
 def _normalise_version(value: str | None) -> tuple[int, ...] | None:
     if not value:
         return None
@@ -79,12 +94,12 @@ def invocation(
             if node:
                 return [node, str(path)], {"source": "project_yarn_path", "version": version}
         package = f"@yarnpkg/cli-dist@{version}" if version else "@yarnpkg/cli-dist@latest"
-        return ["npx", "--yes", "--package", package, "yarn"], {"source": "npx", "version": version}
+        return _npx_prefix(package, "yarn"), {"source": "npx-offline-cache", "version": version}
     if manager == "yarn":
         package = f"yarn@{version or '1.22.22'}"
-        return ["npx", "--yes", "--package", package, "yarn"], {"source": "npx", "version": version or "1.22.22"}
+        return _npx_prefix(package, "yarn"), {"source": "npx-offline-cache", "version": version or "1.22.22"}
     package = f"{manager}@{version}" if version else f"{manager}@latest"
-    return ["npx", "--yes", "--package", package, manager], {"source": "npx", "version": version}
+    return _npx_prefix(package, manager), {"source": "npx-offline-cache", "version": version}
 
 
 def command(

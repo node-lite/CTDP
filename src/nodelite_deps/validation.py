@@ -147,6 +147,8 @@ def _proxy_environment(proxy: _OutboundCapture) -> dict[str, str]:
         "all_proxy": proxy.url,
         "NO_PROXY": "127.0.0.1,localhost",
         "no_proxy": "127.0.0.1,localhost",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oConnectTimeout=10 -oConnectionAttempts=1",
+        "GIT_TERMINAL_PROMPT": "0",
     }
 
 
@@ -157,14 +159,29 @@ def _artifact_maps(artifacts: list[dict[str, Any]]) -> tuple[dict[str, dict[str,
         if artifact.get("status") not in {"downloaded", "reused"} or not artifact.get("cas_path"):
             continue
         source = artifact.get("source_url") or artifact.get("source")
-        if artifact.get("type") in {"registry", "http_tarball"} and isinstance(source, str) and source.startswith(("http://", "https://")):
+        if artifact.get("type") in {"registry", "http_tarball", "git"} and isinstance(source, str):
             by_source[source] = artifact
             by_source[source.split("#", 1)[0]] = artifact
         name, version = artifact.get("name"), artifact.get("version")
         if isinstance(name, str) and isinstance(version, str) and artifact.get("type") == "registry":
             key = (name, version)
             current = by_package.get(key)
-            if current is None or (not current.get("integrity") and artifact.get("integrity")):
+            def source_consistent(item: dict[str, Any]) -> bool:
+                item_source = item.get("source_url") or item.get("source")
+                if not isinstance(item_source, str) or "/-/" not in item_source:
+                    return True
+                item_filename = item_source.split("#", 1)[0].rsplit("/", 1)[-1]
+                return item_filename == f"{name.rsplit('/', 1)[-1]}-{version}.tgz"
+
+            if current is None or (
+                source_consistent(artifact),
+                bool(artifact.get("integrity")),
+                bool(artifact.get("content_sha256")),
+            ) > (
+                source_consistent(current),
+                bool(current.get("integrity")),
+                bool(current.get("content_sha256")),
+            ):
                 by_package[key] = artifact
     return by_source, by_package
 
@@ -181,16 +198,56 @@ def _artifact_for_url(
     without_fragment = value.split("#", 1)[0]
     if without_fragment in by_source:
         return by_source[without_fragment]
+    if value.startswith("gist:"):
+        gist_id = value.removeprefix("gist:").split("#", 1)[0].removesuffix(".git")
+        for source, artifact in by_source.items():
+            if artifact.get("type") == "git" and f"gist.github.com/{gist_id}" in source:
+                return artifact
+    if value.startswith("github:"):
+        repository = value.removeprefix("github:").split("#", 1)[0].removesuffix(".git")
+        for source, artifact in by_source.items():
+            if artifact.get("type") == "git" and f"github.com/{repository}" in source:
+                return artifact
     if name and version and (name, version) in by_package:
         return by_package[(name, version)]
     parsed = urlparse(without_fragment)
-    filename = parsed.path.rsplit("/", 1)[-1]
+    path = parsed.path.strip("/")
+    package_from_path = path.split("/-/", 1)[0] if "/-/" in path else None
+    if package_from_path and package_from_path.startswith("registry/"):
+        package_from_path = package_from_path.removeprefix("registry/")
+    filename = path.rsplit("/", 1)[-1]
     if filename.endswith(".tgz"):
         stem = filename[:-4]
         for (package_name, package_version), artifact in by_package.items():
+            if package_from_path and package_name != package_from_path:
+                continue
             if stem == f"{package_name.rsplit('/', 1)[-1]}-{package_version}":
+                source = artifact.get("source_url") or artifact.get("source")
+                if isinstance(source, str) and "/-/" in source:
+                    source_filename = source.split("#", 1)[0].rsplit("/", 1)[-1]
+                    if source_filename != filename:
+                        continue
                 return artifact
     return None
+
+
+def _rewrite_lock_urls(
+    text: str,
+    registry: LocalArtifactRegistry,
+    by_source: dict[str, dict[str, Any]],
+    by_package: dict[tuple[str, str], dict[str, Any]],
+) -> str:
+    url_pattern = re.compile(r"(?:https?|git\+https?|git\+ssh|github|gist):[^\s\"']+")
+
+    def replace(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        value = raw.rstrip(",)")
+        artifact = _artifact_for_url(value, by_source, by_package)
+        if artifact:
+            return registry.tarball_url(artifact) + raw[len(value):]
+        return raw
+
+    return url_pattern.sub(replace, text)
 
 
 def _local_url(
@@ -254,13 +311,7 @@ def _rewrite_text_lock(
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return
-    replacements: dict[str, str] = {}
-    for source, artifact in by_source.items():
-        if source.startswith(("http://", "https://")):
-            replacements[source] = registry.tarball_url(artifact)
-    for source, replacement in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
-        text = text.replace(source, replacement)
-    path.write_text(text, encoding="utf-8")
+    path.write_text(_rewrite_lock_urls(text, registry, by_source, by_package), encoding="utf-8")
 
 
 def _rewrite_package_json(
@@ -279,7 +330,7 @@ def _rewrite_package_json(
         if not isinstance(entries, dict):
             continue
         for name, spec in list(entries.items()):
-            if isinstance(spec, str) and spec.startswith(("http://", "https://")):
+            if isinstance(spec, str) and spec.startswith(("http://", "https://", "git+", "github:", "gist:")):
                 entries[name] = _local_url(spec, registry, by_source, by_package, name)
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -310,7 +361,7 @@ def _prepare_checkout(
         _rewrite_package_json(package_json, registry, by_source, by_package)
     source_lock = record.get("source_lockfile") if record else None
     resolved_lock = record.get("resolved_lockfile") if record else None
-    lock_name = source_lock or (Path(resolved_lock).name if resolved_lock else None)
+    lock_name = Path(resolved_lock).name if resolved_lock else source_lock
     if resolved_lock:
         resolved_path = project_dir / resolved_lock
         if resolved_path.exists() and lock_name:
@@ -331,6 +382,17 @@ def _prepare_checkout(
         yarnrc.write_text(yarnrc.read_text(encoding="utf-8", errors="replace").rstrip() + f'\nregistry "{registry.base_url}"\n', encoding="utf-8")
     yarnrc_yml = root_dir / ".yarnrc.yml"
     existing_yml = yarnrc_yml.read_text(encoding="utf-8", errors="replace") if yarnrc_yml.exists() else ""
+    sanitized_yml: list[str] = []
+    skip_plugins = False
+    for line in existing_yml.splitlines():
+        if line.startswith("plugins:"):
+            skip_plugins = True
+            continue
+        if skip_plugins and line and not line[0].isspace():
+            skip_plugins = False
+        if not skip_plugins and not line.lstrip().startswith("yarnPath:"):
+            sanitized_yml.append(line)
+    existing_yml = "\n".join(sanitized_yml)
     yarnrc_yml.write_text(existing_yml.rstrip() + f"\nnpmRegistryServer: {registry.base_url}\nenableGlobalCache: false\nunsafeHttpWhitelist:\n  - 127.0.0.1\n", encoding="utf-8")
     return temporary, checkout, root_dir, {"temporary_checkout": str(checkout), "source_snapshot": str(source_root)}
 
@@ -357,23 +419,31 @@ def _cache_root(warm: dict[str, Any], manager: str, variant: str | None, version
 def _failure_status(result: dict[str, Any], outbound: list[dict[str, Any]]) -> str:
     if result.get("exit_code") == 0:
         return "success"
-    text = " ".join(str(result.get(key) or "") for key in ("stderr", "stdout")).lower()
-    if outbound or any(token in text for token in ("eai_again", "enotfound", "network", "offline", "fetch", "404", "502", "proxy", "registry", "tarball", "no matching version")):
-        return "external_artifact_miss"
-    if any(token in text for token in ("node-gyp", "gyp", "python", "make", "eacces", "permission denied", "prebuild", "system dependency", "command not found")):
+    text_parts = [str(result.get(key) or "") for key in ("stderr", "stdout")]
+    for key in ("stderr_path", "stdout_path"):
+        path = result.get(key)
+        if path and Path(path).is_file():
+            text_parts.append(Path(path).read_text(encoding="utf-8", errors="replace"))
+    text = " ".join(text_parts).lower()
+    if any(token in text for token in ("workspace not found", "workspace_pkg_not_found", "patches/", "enoent", "file:/tmp/nodelite-deps-validate-")):
+        return "other_failure"
+    if any(token in text for token in ("gyp err", "configure error", "make: ***", "eacces", "permission denied", "command not found", "err_pnpm_unsupported_engine", "found incompatible module", "incompatible module", "node version is incompatible")):
         return "native_or_system_dependency_failure"
+    if outbound or any(token in text for token in ("eai_again", "enotfound", "network connection", "offline", "tunneling socket", "statuscode=404", "status code 404", "statuscode=502", "status code 502", "no matching version", "checksum", "no_offline_tarball", "tarball_integrity", "remote archive doesn't match")):
+        return "external_artifact_miss"
     return "other_failure"
 
 
 def _install_args(manager: str, variant: str | None, has_lock: bool, cache: Path, registry: LocalArtifactRegistry) -> list[str]:
     if manager == "npm":
-        return ["npm", "ci" if has_lock else "install", "--ignore-scripts", "--no-audit", "--no-fund", "--registry", registry.base_url]
+        command = ["npm", "ci" if has_lock else "install", "--ignore-scripts", "--no-audit", "--no-fund", "--registry", registry.base_url]
+        return [*command, "--legacy-peer-deps"]
     if manager == "pnpm":
-        command = ["pnpm", "install", "--ignore-scripts", "--store-dir", str(cache), "--registry", registry.base_url]
+        command = ["pnpm", "install", "--ignore-scripts", "--config.engine-strict=false", "--config.offline=false", "--store-dir", str(cache), "--registry", registry.base_url]
         command.append("--frozen-lockfile" if has_lock else "--no-frozen-lockfile")
         return command
     if manager == "yarn" and variant == "classic":
-        command = ["yarn", "install", "--ignore-scripts", "--non-interactive", "--cache-folder", str(cache), "--registry", registry.base_url]
+        command = ["yarn", "install", "--ignore-scripts", "--ignore-engines", "--non-interactive", "--cache-folder", str(cache), "--registry", registry.base_url]
         if has_lock:
             command.append("--frozen-lockfile")
         return command
@@ -417,7 +487,7 @@ def _run_g1(
         result = run_command(
             native_command,
             cwd=root_dir,
-            env={**_proxy_environment(proxy), "npm_config_cache": str(cache), "npm_config_registry": registry.base_url},
+            env={**_proxy_environment(proxy), "npm_config_cache": str(cache), "npm_config_registry": registry.base_url, "npm_config_offline": "false", "PNPM_CONFIG_OFFLINE": "false"},
             timeout=timeout,
             stdout_path=log_dir / f"{_root_name(root['dependency_root'])}-g1.stdout.log",
             stderr_path=log_dir / f"{_root_name(root['dependency_root'])}-g1.stderr.log",
@@ -475,7 +545,7 @@ def _run_g2(
         result = run_command(
             ["sh", "-lc", command_text],
             cwd=checkout,
-            env={**_proxy_environment(proxy), "PATH": str(wrapper_dir) + os.pathsep + os.environ.get("PATH", ""), "npm_config_registry": registry.base_url},
+            env={**_proxy_environment(proxy), "PATH": str(wrapper_dir) + os.pathsep + os.environ.get("PATH", ""), "npm_config_registry": registry.base_url, "npm_config_offline": "false", "PNPM_CONFIG_OFFLINE": "false"},
             timeout=min(timeout, 60),
             stdout_path=log_dir / f"{_root_name(root['dependency_root'])}-g2.stdout.log",
             stderr_path=log_dir / f"{_root_name(root['dependency_root'])}-g2.stderr.log",
@@ -557,6 +627,15 @@ def validate(out: Path, *, force: bool = False, timeout: int = 1800) -> dict[str
                     for item in cas_misses
                     for reference in item.get("referenced_by", [])
                 )
+                profile_git_miss = any(
+                    item.get("type") == "git"
+                    and any(
+                        reference.get("profile_id") == profile["profile_id"]
+                        and reference.get("dependency_root") in (None, root["dependency_root"])
+                        for reference in item.get("referenced_by", [])
+                    )
+                    for item in artifacts
+                )
                 dockerfile = out / "projects" / profile["safe_profile_id"] / "environment" / "Dockerfile"
                 docker_text = dockerfile.read_text(encoding="utf-8", errors="replace").lower() if dockerfile.exists() else ""
                 static_external = any(token in docker_text for token in ("playwright install", "electron", "puppeteer.download", "chromedriver"))
@@ -592,6 +671,7 @@ def validate(out: Path, *, force: bool = False, timeout: int = 1800) -> dict[str
                         "g2": g2,
                         "static_external_download": static_external,
                         "cas_miss": profile_root_miss,
+                        "external_git_dependency": profile_git_miss,
                         "outbound_requests": g1.get("outbound_requests", []) + g2.get("outbound_requests", []),
                     }
                 root_result.setdefault("dependency_root", root["dependency_root"])

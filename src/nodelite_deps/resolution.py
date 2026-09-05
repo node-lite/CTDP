@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,30 @@ STRICT_MARKERS = {
     "pnpm": ("--frozen-lockfile", "--frozen"),
     "yarn": ("--frozen-lockfile", "--immutable"),
 }
+
+
+def _resolution_environment(manager: str) -> dict[str, str]:
+    environment = {
+        "npm_config_engine_strict": "false",
+        "NPM_CONFIG_ENGINE_STRICT": "false",
+    }
+    if manager == "pnpm":
+        environment["npm_config_engine_strict"] = "false"
+    return environment
+
+
+def _retry_resolution_command(command: list[str], manager: str, output: str | None) -> list[str] | None:
+    text = (output or "").lower()
+    if manager == "npm" and ("eresolve" in text or "peer dep" in text or "unable to resolve dependency tree" in text):
+        if "--legacy-peer-deps" not in command:
+            return [*command, "--legacy-peer-deps"]
+    if manager == "pnpm" and ("unsupported engine" in text or "engine" in text and "incompatible" in text):
+        if "--config.engine-strict=false" not in command:
+            return [*command, "--config.engine-strict=false"]
+    if manager == "yarn" and ("incompatible" in text and "engine" in text):
+        if "--ignore-engines" not in command:
+            return [*command, "--ignore-engines"]
+    return None
 
 
 def _root_name(root: str) -> str:
@@ -277,7 +302,35 @@ def _resolve_root(profile: dict[str, Any], root: dict[str, Any], project_dir: Pa
         ) or root.get("package_manager_version")
         stdout_path = project_dir / "logs" / "resolution" / f"{_root_name(root['dependency_root'])}.stdout.log"
         stderr_path = project_dir / "logs" / "resolution" / f"{_root_name(root['dependency_root'])}.stderr.log"
-        result = run_command(native_command, cwd=root_dir, timeout=timeout, stdout_path=stdout_path, stderr_path=stderr_path)
+        result = run_command(
+            native_command,
+            cwd=root_dir,
+            env=_resolution_environment(manager),
+            timeout=timeout,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+        failure_output = ""
+        if result.get("exit_code") != 0:
+            for output_path in (stdout_path, stderr_path):
+                if output_path.exists():
+                    failure_output += output_path.read_text(encoding="utf-8", errors="replace")
+        retry_command = _retry_resolution_command(native_command, manager, failure_output)
+        if retry_command:
+            retry_result = run_command(
+                retry_command,
+                cwd=root_dir,
+                env=_resolution_environment(manager),
+                timeout=timeout,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            )
+            retry_result["resolution_retry"] = {
+                "trigger": "known resolver compatibility failure",
+                "original_command": native_command,
+                "retry_command": retry_command,
+            }
+            result = retry_result
         generated_name = {"npm": "package-lock.json", "pnpm": "pnpm-lock.yaml", "yarn": "yarn.lock", "bun": "bun.lock"}.get(manager)
         generated = root_dir / generated_name if generated_name else None
         if result["exit_code"] == 0 and generated and generated.exists():
@@ -294,7 +347,7 @@ def _resolve_root(profile: dict[str, Any], root: dict[str, Any], project_dir: Pa
                 "lockfile_changed": changed, "resolve_elapsed_ms": result["elapsed_ms"], "exit_code": 0,
                 "command": native_command, "requested_command": command, "tool_version": detected_tool_version, "scripts_ran": False,
                 "network_metadata_accessed": True, "stdout_path": str(stdout_path), "stderr_path": str(stderr_path),
-                "manifest_edits_applied": applied_edits, "evidence": evidence + checkout_evidence + [tool_evidence, {"kind": "resolution", "reason": command_reason}],
+                "manifest_edits_applied": applied_edits, "evidence": evidence + checkout_evidence + [tool_evidence, {"kind": "resolution", "reason": command_reason}, *([result["resolution_retry"]] if result.get("resolution_retry") else [])],
             }
         return {
             "profile_id": profile["profile_id"], "dependency_root": root["dependency_root"], "package_manager": manager,
@@ -305,8 +358,30 @@ def _resolve_root(profile: dict[str, Any], root: dict[str, Any], project_dir: Pa
             "lockfile_changed": False, "resolve_elapsed_ms": result["elapsed_ms"], "exit_code": result["exit_code"],
             "command": native_command, "requested_command": command, "tool_version": detected_tool_version, "scripts_ran": False,
             "network_metadata_accessed": True, "stdout_path": str(stdout_path), "stderr_path": str(stderr_path),
-            "manual_review": [result.get("stderr")], "manifest_edits_applied": applied_edits, "evidence": evidence + checkout_evidence + [tool_evidence],
+            "manual_review": [result.get("stderr")], "manifest_edits_applied": applied_edits, "evidence": evidence + checkout_evidence + [tool_evidence, *([result["resolution_retry"]] if result.get("resolution_retry") else [])],
         }
+
+
+def _resolve_profile(profile: dict[str, Any], out: Path, timeout: int) -> dict[str, Any]:
+    project_dir = out / "projects" / profile["safe_profile_id"]
+    profile_records: list[dict[str, Any]] = []
+    manual_review: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    profile_started = time.monotonic()
+    for root in profile.get("dependency_roots", []):
+        record = _resolve_root(profile, root, project_dir, out, timeout)
+        profile_records.append(record)
+        if record.get("classification") == "unsupported_or_manual_review":
+            manual_review.append(record)
+            if record.get("exit_code") not in (None, 0):
+                failures.append(record)
+    return {
+        "profile_id": profile["profile_id"],
+        "profile_records": profile_records,
+        "manual_review": manual_review,
+        "failures": failures,
+        "elapsed_ms": round((time.monotonic() - profile_started) * 1000),
+    }
 
 
 def resolve(out: Path, *, force: bool = False, timeout: int = 1800) -> dict[str, Any]:
@@ -324,24 +399,33 @@ def resolve(out: Path, *, force: bool = False, timeout: int = 1800) -> dict[str,
     records: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     manual_review: list[dict[str, Any]] = []
-    for profile in inventory.get("profiles", []):
-        project_dir = out / "projects" / profile["safe_profile_id"]
-        profile_records: list[dict[str, Any]] = []
-        for root in profile.get("dependency_roots", []):
-            record = _resolve_root(profile, root, project_dir, out, timeout)
-            profile_records.append(record)
-            if record.get("classification") == "unsupported_or_manual_review":
-                manual_review.append(record)
-                if record.get("exit_code") not in (None, 0):
-                    failures.append(record)
-        write_json(project_dir / "resolution.json", {"profile_id": profile["profile_id"], "roots": profile_records})
-        records.extend(profile_records)
-        logger.emit(
-            "profile_resolved",
-            profile_id=profile["profile_id"],
-            roots=len(profile_records),
-            elapsed_ms=sum(item.get("resolve_elapsed_ms", 0) for item in profile_records),
-        )
+    profile_order = {str(profile["profile_id"]): index for index, profile in enumerate(inventory.get("profiles", []))}
+    max_workers = min(8, len(profile_order) or 1)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_resolve_profile, profile, out, timeout): profile
+            for profile in inventory.get("profiles", [])
+        }
+        completed_profiles: dict[str, dict[str, Any]] = {}
+        for future in as_completed(futures):
+            profile = futures[future]
+            result = future.result()
+            profile_records = result["profile_records"]
+            project_dir = out / "projects" / profile["safe_profile_id"]
+            write_json(project_dir / "resolution.json", {"profile_id": profile["profile_id"], "roots": profile_records})
+            records.extend(profile_records)
+            manual_review.extend(result["manual_review"])
+            failures.extend(result["failures"])
+            completed_profiles[profile["profile_id"]] = result
+            logger.emit(
+                "profile_resolved",
+                profile_id=profile["profile_id"],
+                roots=len(profile_records),
+                elapsed_ms=result["elapsed_ms"],
+            )
+    records.sort(key=lambda item: (profile_order.get(str(item["profile_id"]), 10**9), str(item["dependency_root"])))
+    manual_review.sort(key=lambda item: (profile_order.get(str(item["profile_id"]), 10**9), str(item["dependency_root"])))
+    failures.sort(key=lambda item: (profile_order.get(str(item["profile_id"]), 10**9), str(item["dependency_root"])))
     result = {
         "schema_version": 1,
         "profiles": records,
